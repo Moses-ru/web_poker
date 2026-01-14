@@ -5,15 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PIXEL POKER MULTIPLAYER</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Telegram Web App SDK -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <!-- Firebase SDKs - ИСПОЛЬЗУЕМ ПОЛНЫЕ URL ДЛЯ БРАУЗЕРА -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Ваша конфигурация
         const firebaseConfig = {
             apiKey: "AIzaSyBq82rTga0Aeh1TueIbGJ7hyRq-rrF_m7Y",
             authDomain: "bot-moses.firebaseapp.com",
@@ -24,23 +21,17 @@
             measurementId: "G-D9P14CDNB6"
         };
 
-        // Инициализация Firebase
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        
-        // Используем projectId как appId для путей Firestore, если запускаем вне моей среды
         const appId = "bot-moses-game"; 
 
-        // Инициализация Telegram
         const tg = window.Telegram?.WebApp;
         if (tg) {
             tg.ready();
             tg.expand();
-            document.body.style.backgroundColor = tg.themeParams.bg_color || '#0f0f14';
         }
 
-        // --- ГРАФИЧЕСКАЯ ЧАСТЬ (Canvas) ---
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
         const WIDTH = 1000, HEIGHT = 750;
@@ -48,8 +39,8 @@
 
         const COLORS = {
             BLACK: '#0a0a0f', WHITE: '#f0f0f5', RED: '#ff1e50',
-            GREEN_DARK: '#00641e', GREEN_MID: '#00a032', GOLD: '#ffd700',
-            BLUE: '#0082ff', PURPLE: '#7828c8', GRAY: '#50505a'
+            GREEN_DARK: '#004d1a', GREEN_MID: '#00802b', GOLD: '#ffd700',
+            BLUE: '#0082ff', PURPLE: '#7828c8', GRAY: '#50505a', DARK_GRAY: '#202025'
         };
 
         const RANKS = '2 3 4 5 6 7 8 9 10 J Q K A'.split(' ');
@@ -57,9 +48,9 @@
 
         function drawPixelRect(x, y, w, h, p, color, shadow = false) {
             if (shadow) {
-                ctx.fillStyle = 'rgba(0,0,0,0.5)';
-                ctx.fillRect(x + p + 6, y + 6, w - 2*p, h);
-                ctx.fillRect(x + 6, y + p + 6, w, h - 2*p);
+                ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                ctx.fillRect(x + p + 4, y + 4, w - 2*p, h);
+                ctx.fillRect(x + 4, y + p + 4, w, h - 2*p);
             }
             ctx.fillStyle = color;
             ctx.fillRect(x + p, y, w - 2*p, h);
@@ -107,31 +98,20 @@
             }
         }
 
-        // --- ЛОГИКА МУЛЬТИПЛЕЕРА ---
         window.Game = {
-            user: null,
-            roomRef: null,
-            roomData: null,
-            role: null,
-            state: 'LOBBY',
-            rooms: [],
-            userId: null,
-            userName: null,
+            user: null, roomRef: null, roomData: null, role: null,
+            state: 'LOBBY', rooms: [], userId: null, userName: null,
+            errorMessage: null, userBalance: 1000,
 
             async init() {
-                // Анонимный вход
-                try {
-                    await signInAnonymously(auth);
-                } catch (e) {
-                    console.error("Auth failed:", e);
-                }
-
-                onAuthStateChanged(auth, (user) => {
+                onAuthStateChanged(auth, async (user) => {
                     if (user) {
                         this.user = user;
                         this.userId = tg?.initDataUnsafe?.user?.id?.toString() || user.uid;
-                        this.userName = tg?.initDataUnsafe?.user?.first_name || "Player_" + user.uid.slice(0, 4);
-                        this.refreshLobby();
+                        this.userName = tg?.initDataUnsafe?.user?.first_name || "Игрок_" + this.userId.slice(0, 4);
+                        await this.refreshLobby();
+                    } else {
+                        signInAnonymously(auth);
                     }
                 });
 
@@ -149,35 +129,62 @@
                     const snap = await getDocs(roomsCol);
                     this.rooms = snap.docs
                         .map(doc => ({ id: doc.id, ...doc.data() }))
-                        .filter(r => r.state === 'WAITING');
-                } catch(e) { console.error("Refresh fail:", e); }
+                        .filter(r => r.state === 'WAITING' || r.state === 'PLAYING');
+                    this.errorMessage = null;
+                } catch(e) { 
+                    this.errorMessage = "Ошибка Firestore: Проверьте правила";
+                }
             },
 
             async createRoom() {
                 this.state = 'CONNECTING';
-                const roomID = `room_${Date.now()}`;
-                this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
-                this.role = 'host';
-                const initialData = {
-                    hostId: this.userId, hostName: this.userName,
-                    guestId: null, guestName: null,
-                    pot: 0, currentBet: 20, turn: this.userId,
-                    state: 'WAITING', community: [],
-                    hostCards: this.generateHand(), guestCards: this.generateHand(),
-                    lastAction: 'Waiting for player'
-                };
-                await setDoc(this.roomRef, initialData);
-                this.listenToRoom();
+                try {
+                    const roomID = `room_${this.userId}`;
+                    this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
+                    this.role = 'host';
+                    const initialData = {
+                        hostId: this.userId, hostName: this.userName, hostBalance: this.userBalance,
+                        guestId: null, guestName: null, guestBalance: 0,
+                        pot: 0, currentBet: 0, lastBet: 20, turn: this.userId,
+                        state: 'WAITING', community: [],
+                        hostCards: this.generateHand(), guestCards: this.generateHand(),
+                        lastAction: 'Ожидание оппонента', winner: null
+                    };
+                    await setDoc(this.roomRef, initialData);
+                    this.listenToRoom();
+                } catch(e) {
+                    this.state = 'LOBBY';
+                    this.errorMessage = "Ошибка создания: " + e.message;
+                }
             },
 
             async joinRoom(roomID) {
                 this.state = 'CONNECTING';
-                this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
-                this.role = 'guest';
-                await updateDoc(this.roomRef, { 
-                    guestId: this.userId, guestName: this.userName, state: 'PLAYING'
-                });
-                this.listenToRoom();
+                try {
+                    this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
+                    this.role = 'guest';
+                    await updateDoc(this.roomRef, { 
+                        guestId: this.userId, guestName: this.userName, guestBalance: this.userBalance, state: 'PLAYING'
+                    });
+                    this.listenToRoom();
+                } catch(e) {
+                    this.state = 'LOBBY';
+                    this.errorMessage = "Ошибка входа: " + e.message;
+                }
+            },
+
+            async leaveRoom() {
+                if (this.roomRef) {
+                    if (this.role === 'host') {
+                        await deleteDoc(this.roomRef);
+                    } else {
+                        await updateDoc(this.roomRef, { guestId: null, guestName: null, state: 'WAITING' });
+                    }
+                }
+                this.state = 'LOBBY';
+                this.roomRef = null;
+                this.roomData = null;
+                this.refreshLobby();
             },
 
             listenToRoom() {
@@ -185,7 +192,13 @@
                     if (doc.exists()) {
                         this.roomData = doc.data();
                         this.state = this.roomData.state;
+                        if (this.role === 'host') this.userBalance = this.roomData.hostBalance;
+                        else this.userBalance = this.roomData.guestBalance;
+                    } else {
+                        this.state = 'LOBBY';
                     }
+                }, (err) => {
+                    this.errorMessage = "Ошибка синхронизации: " + err.message;
                 });
             },
 
@@ -202,15 +215,40 @@
                 let nextTurn = this.role === 'host' ? this.roomData.guestId : this.roomData.hostId;
                 let updates = { turn: nextTurn, lastAction: `${this.userName}: ${action}` };
 
+                const betAmount = this.roomData.lastBet;
+
                 if (action === 'CALL') {
-                    updates.pot = this.roomData.pot + this.roomData.currentBet;
+                    updates.pot = this.roomData.pot + betAmount;
+                    if (this.role === 'host') updates.hostBalance = this.roomData.hostBalance - betAmount;
+                    else updates.guestBalance = this.roomData.guestBalance - betAmount;
+
+                    // Продвижение по стадиям
                     if (this.roomData.community.length === 0) updates.community = [this.generateHand()[0], this.generateHand()[0], this.generateHand()[0]];
                     else if (this.roomData.community.length < 5) updates.community = [...this.roomData.community, this.generateHand()[0]];
-                    else updates.state = 'SHOWDOWN';
+                    else {
+                        updates.state = 'SHOWDOWN';
+                        updates.winner = this.calculateWinner();
+                    }
+                } else if (action === 'RAISE') {
+                    const raiseVal = betAmount + 20;
+                    updates.pot = this.roomData.pot + raiseVal;
+                    updates.lastBet = raiseVal;
+                    if (this.role === 'host') updates.hostBalance = this.roomData.hostBalance - raiseVal;
+                    else updates.guestBalance = this.roomData.guestBalance - raiseVal;
                 } else if (action === 'FOLD') {
                     updates.state = 'FINISHED';
+                    updates.winner = this.role === 'host' ? 'guest' : 'host';
                 }
+
                 await updateDoc(this.roomRef, updates);
+            },
+
+            calculateWinner() {
+                // Упрощенная логика: кто больше по сумме рангов
+                const getPower = (cards) => cards.reduce((sum, c) => sum + RANKS.indexOf(c.r), 0);
+                const hostPower = getPower([...this.roomData.hostCards, ...this.roomData.community]);
+                const guestPower = getPower([...this.roomData.guestCards, ...this.roomData.community]);
+                return hostPower >= guestPower ? 'host' : 'guest';
             },
 
             handleClick(e) {
@@ -222,15 +260,21 @@
                     if (x > 700 && x < 950 && y > 650 && y < 710) this.createRoom();
                     if (x > 50 && x < 250 && y > 650 && y < 710) this.refreshLobby();
                     this.rooms.forEach((room, i) => {
-                        const ry = 150 + i * 80;
+                        const ry = 180 + i * 80;
                         if (x > 100 && x < 900 && y > ry && y < ry + 60) this.joinRoom(room.id);
                     });
+                } else if (this.state === 'WAITING' || this.state === 'PLAYING') {
+                    // Кнопка ВЫЙТИ (сверху справа)
+                    if (x > 850 && x < 980 && y > 20 && y < 70) this.leaveRoom();
+                    
+                    if (this.state === 'PLAYING' && this.roomData?.turn === this.userId) {
+                        if (x > 410 && x < 530 && y > 660 && y < 720) this.makeMove('CALL');
+                        if (x > 540 && x < 660 && y > 660 && y < 720) this.makeMove('RAISE');
+                        if (x > 280 && x < 400 && y > 660 && y < 720) this.makeMove('FOLD');
+                    }
+                } else if (this.state === 'SHOWDOWN' || this.state === 'FINISHED') {
+                    this.leaveRoom();
                 }
-                if (this.state === 'PLAYING' && this.roomData?.turn === this.userId) {
-                    if (x > 390 && x < 510 && y > 660 && y < 720) this.makeMove('CALL');
-                    if (x > 260 && x < 380 && y > 660 && y < 720) this.makeMove('FOLD');
-                }
-                if (this.state === 'SHOWDOWN' || this.state === 'FINISHED') location.reload();
             },
 
             drawPanel(text, x, y, textCol, bgCol, borderCol, width = 250, height = 40) {
@@ -243,47 +287,92 @@
                 ctx.fillText(text, x, y + 5);
             },
 
+            drawChips(x, y, count) {
+                const stack = Math.min(Math.floor(count / 20), 10);
+                for(let i=0; i<stack; i++) {
+                    ctx.fillStyle = COLORS.BLACK;
+                    ctx.beginPath(); ctx.ellipse(x, y - i*4, 15, 8, 0, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = i % 2 === 0 ? COLORS.RED : COLORS.BLUE;
+                    ctx.beginPath(); ctx.ellipse(x, y - i*4 - 2, 15, 8, 0, 0, Math.PI*2); ctx.fill();
+                    ctx.strokeStyle = COLORS.WHITE; ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            },
+
             loop() {
-                ctx.fillStyle = '#0f0f14';
+                ctx.fillStyle = COLORS.DARK_GRAY;
                 ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
+                if (this.errorMessage) {
+                    this.drawPanel(this.errorMessage, WIDTH/2, 25, COLORS.WHITE, COLORS.RED, COLORS.WHITE, 900, 30);
+                }
+
                 if (this.state === 'LOBBY') {
-                    this.drawPanel("LOBBY - PIXEL POKER", WIDTH/2, 60, COLORS.GOLD, COLORS.BLACK, COLORS.GOLD, 500, 60);
+                    this.drawPanel("ЛОББИ PIXEL POKER", WIDTH/2, 80, COLORS.GOLD, COLORS.BLACK, COLORS.GOLD, 600, 60);
+                    this.drawPanel(`БАЛАНС: $${this.userBalance}`, WIDTH/2, 140, COLORS.WHITE, COLORS.DARK_GRAY, COLORS.GRAY, 300, 30);
+                    
                     if (this.rooms.length === 0) {
                         ctx.fillStyle = COLORS.GRAY; ctx.textAlign = 'center';
-                        ctx.fillText("NO ROOMS FOUND", WIDTH/2, HEIGHT/2);
+                        ctx.fillText("НЕТ ДОСТУПНЫХ КОМНАТ", WIDTH/2, HEIGHT/2);
                     }
                     this.rooms.forEach((room, i) => {
-                        const ry = 150 + i * 80;
-                        this.drawPanel(`JOIN: ${room.hostName.toUpperCase()}`, WIDTH/2, ry + 30, COLORS.WHITE, COLORS.BLUE, COLORS.WHITE, 800, 60);
+                        const ry = 220 + i * 80;
+                        const status = room.state === 'WAITING' ? 'СВОБОДНО' : 'В ИГРЕ';
+                        this.drawPanel(`${room.hostName.toUpperCase()} - ${status}`, WIDTH/2, ry, COLORS.WHITE, room.state === 'WAITING' ? COLORS.BLUE : COLORS.PURPLE, COLORS.WHITE, 800, 60);
                     });
-                    this.drawPanel("CREATE GAME", 825, 680, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 250, 60);
-                    this.drawPanel("REFRESH", 150, 680, COLORS.WHITE, COLORS.GRAY, COLORS.WHITE, 200, 60);
+
+                    this.drawPanel("ОБНОВИТЬ", 150, 680, COLORS.WHITE, COLORS.GRAY, COLORS.WHITE, 220, 60);
+                    this.drawPanel("СОЗДАТЬ", 825, 680, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 250, 60);
+
                 } else if (this.state === 'CONNECTING') {
-                    this.drawPanel("CONNECTING...", WIDTH/2, HEIGHT/2, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD);
-                } else if (this.state === 'WAITING' || !this.roomData) {
-                    this.drawPanel("WAITING FOR OPPONENT...", WIDTH/2, HEIGHT/2, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD, 450);
+                    this.drawPanel("ПОДКЛЮЧЕНИЕ К СЕТИ...", WIDTH/2, HEIGHT/2, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD, 500);
                 } else {
+                    // ИГРОВОЙ СТОЛ
                     drawPixelRect(30, 20, 940, 620, 32, COLORS.GREEN_DARK);
                     drawPixelRect(50, 40, 900, 580, 24, COLORS.GREEN_MID);
-                    const myCards = this.role === 'host' ? this.roomData.hostCards : this.roomData.guestCards;
-                    myCards.forEach((c, i) => new Card(c.r, c.s, 410 + i*110, 500, true).draw());
-                    const oppCards = this.role === 'host' ? this.roomData.guestCards : this.roomData.hostCards;
-                    oppCards.forEach((c, i) => new Card(c.r, c.s, 410 + i*110, 80, this.state === 'SHOWDOWN').draw());
-                    this.roomData.community.forEach((c, i) => new Card(c.r, c.s, 180 + i*110, 290, true).draw());
-                    this.drawPanel(`${this.userName} (YOU)`, 150, 690, COLORS.WHITE, COLORS.BLUE, COLORS.BLACK);
-                    this.drawPanel(this.role === 'host' ? (this.roomData.guestName || "Waiting...") : this.roomData.hostName, 150, 60, COLORS.WHITE, COLORS.RED, COLORS.BLACK);
-                    this.drawPanel(`POT: $${this.roomData.pot}`, 865, 270, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE);
-                    const isMyTurn = this.roomData.turn === this.userId;
-                    this.drawPanel(isMyTurn ? "YOUR TURN" : "OPPONENT'S TURN", WIDTH/2, 210, COLORS.WHITE, COLORS.PURPLE, COLORS.WHITE, 350);
-                    if (this.state === 'PLAYING' && isMyTurn) {
-                        drawPixelRect(260, 660, 120, 60, 8, COLORS.WHITE);
-                        ctx.fillStyle = COLORS.BLACK; ctx.fillText("FOLD", 320, 695);
-                        drawPixelRect(390, 660, 120, 60, 8, COLORS.WHITE);
-                        ctx.fillStyle = COLORS.BLACK; ctx.fillText("CALL", 450, 695);
-                    }
-                    if (this.state === 'SHOWDOWN' || this.state === 'FINISHED') {
-                        this.drawPanel("GAME OVER! TAP TO LOBBY", WIDTH/2, 400, COLORS.BLACK, COLORS.GOLD, COLORS.BLACK, 600);
+
+                    // Кнопка Выйти
+                    this.drawPanel("ВЫЙТИ", 915, 45, COLORS.WHITE, COLORS.RED, COLORS.WHITE, 120, 40);
+
+                    if (this.roomData) {
+                        const isHost = this.role === 'host';
+                        const myCards = isHost ? this.roomData.hostCards : this.roomData.guestCards;
+                        const oppCards = isHost ? this.roomData.guestCards : this.roomData.hostCards;
+                        const myBalance = isHost ? this.roomData.hostBalance : this.roomData.guestBalance;
+                        const oppBalance = isHost ? this.roomData.guestBalance : this.roomData.hostBalance;
+
+                        // Карты
+                        myCards.forEach((c, i) => new Card(c.r, c.s, 410 + i*110, 500, true).draw());
+                        oppCards.forEach((c, i) => new Card(c.r, c.s, 410 + i*110, 80, this.state === 'SHOWDOWN').draw());
+                        this.roomData.community.forEach((c, i) => new Card(c.r, c.s, 230 + i*105, 290, true).draw());
+
+                        // Фишки и Баланс
+                        this.drawChips(350, 550, myBalance);
+                        this.drawChips(350, 150, oppBalance);
+                        this.drawPanel(`$${myBalance}`, 350, 600, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD, 120);
+                        this.drawPanel(`$${oppBalance}`, 350, 80, COLORS.WHITE, COLORS.BLACK, COLORS.GRAY, 120);
+
+                        // Инфо
+                        this.drawPanel(`${this.userName}`, 150, 690, COLORS.WHITE, COLORS.BLUE, COLORS.WHITE);
+                        this.drawPanel(`БАНК: $${this.roomData.pot}`, WIDTH/2, 450, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 300);
+                        
+                        const isMyTurn = this.roomData.turn === this.userId;
+                        if (this.state === 'WAITING') {
+                            this.drawPanel("ОЖИДАНИЕ ИГРОКА...", WIDTH/2, 230, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD, 400);
+                        } else if (this.state === 'PLAYING') {
+                            this.drawPanel(isMyTurn ? "ВАШ ХОД" : "ХОД ОППОНЕНТА", WIDTH/2, 210, COLORS.WHITE, isMyTurn ? COLORS.PURPLE : COLORS.GRAY, COLORS.WHITE, 350);
+                            if (isMyTurn) {
+                                this.drawPanel("FOLD", 340, 690, COLORS.BLACK, COLORS.WHITE, COLORS.RED, 120, 60);
+                                this.drawPanel(`CALL $${this.roomData.lastBet}`, 470, 690, COLORS.BLACK, COLORS.WHITE, COLORS.BLUE, 120, 60);
+                                this.drawPanel("RAISE", 600, 690, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 120, 60);
+                            }
+                        } else {
+                            const winText = this.roomData.winner === this.role ? "ВЫ ВЫИГРАЛИ!" : "ВЫ ПРОИГРАЛИ!";
+                            this.drawPanel(winText, WIDTH/2, 400, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 600, 80);
+                            ctx.font = '8px "Press Start 2P"';
+                            ctx.fillStyle = COLORS.WHITE;
+                            ctx.fillText("НАЖМИТЕ ДЛЯ ВЫХОДА В ЛОББИ", WIDTH/2, 460);
+                        }
                     }
                 }
                 requestAnimationFrame(() => this.loop());
@@ -295,9 +384,9 @@
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
         body { background-color: #0f0f14; margin: 0; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; color: #f0f0f5; font-family: 'Press Start 2P', cursive; touch-action: none; }
-        #game-container { position: relative; border: 4px solid #50505a; width: 100%; max-width: 1000px; aspect-ratio: 1000 / 750; }
+        #game-container { position: relative; border: 4px solid #50505a; width: 100%; max-width: 1000px; aspect-ratio: 1000 / 750; box-shadow: 0 0 50px rgba(0,0,0,0.8); }
         canvas { image-rendering: pixelated; display: block; width: 100%; height: 100%; }
-        #crt-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03)); background-size: 100% 3px, 3px 100%; z-index: 10; }
+        #crt-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03)); background-size: 100% 3px, 3px 100%; z-index: 10; opacity: 0.4; }
     </style>
 </head>
 <body>
