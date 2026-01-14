@@ -11,7 +11,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, getDoc, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, getDoc, collection, query, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Конфигурация из окружения
         const firebaseConfig = JSON.parse(__firebase_config);
@@ -25,7 +25,6 @@
         if (tg) {
             tg.ready();
             tg.expand();
-            // Подстройка цвета под тему Telegram
             document.body.style.backgroundColor = tg.themeParams.bg_color || '#0f0f14';
         }
 
@@ -96,14 +95,14 @@
             }
         }
 
-        // --- ЛОГИКА МУЛЬТИПЛЕЕРА ---
+        // --- ЛОГИКА МУЛЬТИПЛЕЕРА И ЛОББИ ---
         const Game = {
             user: null,
             roomRef: null,
             roomData: null,
             role: null,
-            state: 'CONNECTING',
-            roomID: 'lobby_1',
+            state: 'LOBBY', // Состояния: LOBBY, CONNECTING, WAITING, PLAYING, SHOWDOWN, FINISHED
+            rooms: [],
             userId: null,
             userName: null,
 
@@ -121,16 +120,14 @@
                 onAuthStateChanged(auth, (user) => {
                     if (user) {
                         this.user = user;
-                        // Используем ID пользователя Telegram если доступно
                         this.userId = tg?.initDataUnsafe?.user?.id?.toString() || user.uid;
                         this.userName = tg?.initDataUnsafe?.user?.first_name || "Игрок_" + user.uid.slice(0, 4);
-                        this.joinRoom();
+                        this.refreshLobby();
                     }
                 });
 
                 this.loop();
                 window.addEventListener('mousedown', (e) => this.handleClick(e));
-                // Поддержка тач-событий для Telegram
                 window.addEventListener('touchstart', (e) => {
                     e.preventDefault();
                     const touch = e.touches[0];
@@ -138,55 +135,57 @@
                 }, { passive: false });
             },
 
-            async joinRoom() {
-                if (!this.user) return;
-                this.state = 'WAITING';
+            async refreshLobby() {
+                const roomsCol = collection(db, 'artifacts', appId, 'public', 'data', 'rooms');
+                const snap = await getDocs(roomsCol);
+                this.rooms = snap.docs
+                    .map(doc => ({ id: doc.id, ...doc.data() }))
+                    .filter(r => r.state === 'WAITING');
+            },
 
-                this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', this.roomID);
+            async createRoom() {
+                this.state = 'CONNECTING';
+                const roomID = `room_${Date.now()}`;
+                this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
                 
-                try {
-                    const snap = await getDoc(this.roomRef);
+                this.role = 'host';
+                const initialData = {
+                    hostId: this.userId,
+                    hostName: this.userName,
+                    guestId: null,
+                    guestName: null,
+                    pot: 0,
+                    currentBet: 20,
+                    turn: this.userId,
+                    state: 'WAITING',
+                    community: [],
+                    hostCards: this.generateHand(),
+                    guestCards: this.generateHand(),
+                    lastAction: 'Ожидание оппонента'
+                };
+                await setDoc(this.roomRef, initialData);
+                this.listenToRoom();
+            },
 
-                    if (!snap.exists() || snap.data().state === 'FINISHED') {
-                        this.role = 'host';
-                        const initialData = {
-                            hostId: this.userId,
-                            hostName: this.userName,
-                            guestId: null,
-                            guestName: null,
-                            pot: 0,
-                            currentBet: 20,
-                            turn: this.userId,
-                            state: 'WAITING',
-                            community: [],
-                            hostCards: this.generateHand(),
-                            guestCards: this.generateHand(),
-                            lastAction: 'Игра началась'
-                        };
-                        await setDoc(this.roomRef, initialData);
-                    } else {
-                        const data = snap.data();
-                        if (data.hostId !== this.userId && !data.guestId) {
-                            this.role = 'guest';
-                            await updateDoc(this.roomRef, { 
-                                guestId: this.userId, 
-                                guestName: this.userName,
-                                state: 'PLAYING'
-                            });
-                        } else {
-                            this.role = (data.hostId === this.userId) ? 'host' : 'guest';
-                        }
-                    }
+            async joinRoom(roomID) {
+                this.state = 'CONNECTING';
+                this.roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
+                this.role = 'guest';
+                
+                await updateDoc(this.roomRef, { 
+                    guestId: this.userId, 
+                    guestName: this.userName,
+                    state: 'PLAYING'
+                });
+                this.listenToRoom();
+            },
 
-                    onSnapshot(this.roomRef, (doc) => {
-                        if (!doc.exists()) return;
-                        this.roomData = doc.data();
-                        this.state = this.roomData.state;
-                    }, (err) => console.error("Firestore Error:", err));
-
-                } catch (e) {
-                    console.error("Join Room Error:", e);
-                }
+            listenToRoom() {
+                onSnapshot(this.roomRef, (doc) => {
+                    if (!doc.exists()) return;
+                    this.roomData = doc.data();
+                    this.state = this.roomData.state;
+                });
             },
 
             generateHand() {
@@ -230,22 +229,41 @@
                 const x = (e.clientX - rect.left) * scaleX;
                 const y = (e.clientY - rect.top) * scaleY;
 
+                // Клик в Лобби
+                if (this.state === 'LOBBY') {
+                    // Кнопка Создать (справа внизу)
+                    if (x > 700 && x < 950 && y > 650 && y < 710) {
+                        this.createRoom();
+                    }
+                    // Кнопка Обновить
+                    if (x > 50 && x < 250 && y > 650 && y < 710) {
+                        this.refreshLobby();
+                    }
+                    // Клик по списку комнат
+                    this.rooms.forEach((room, i) => {
+                        const ry = 150 + i * 80;
+                        if (x > 100 && x < 900 && y > ry && y < ry + 60) {
+                            this.joinRoom(room.id);
+                        }
+                    });
+                }
+
+                // Клик в Игре
                 if (this.state === 'PLAYING' && this.roomData?.turn === this.userId) {
                     if (x > 390 && x < 510 && y > 660 && y < 720) this.makeMove('CALL');
                     if (x > 260 && x < 380 && y > 660 && y < 720) this.makeMove('FOLD');
                 }
                 
                 if (this.state === 'SHOWDOWN' || this.state === 'FINISHED') {
-                   updateDoc(this.roomRef, { state: 'FINISHED' }).then(() => location.reload());
+                   location.reload();
                 }
             },
 
-            drawPanel(text, x, y, textCol, bgCol, borderCol, width = 250) {
+            drawPanel(text, x, y, textCol, bgCol, borderCol, width = 250, height = 40) {
                 ctx.font = '10px "Press Start 2P"';
-                const h = 40;
-                drawPixelRect(x - width/2, y - h/2, width, h, 6, COLORS.BLACK, true);
-                drawPixelRect(x - width/2, y - h/2, width, h, 6, borderCol);
-                drawPixelRect(x - width/2 + 4, y - h/2 + 4, width - 8, h - 8, 4, bgCol);
+                drawPixelRect(x - width/2, y - height/2, width, height, 6, COLORS.BLACK, true);
+                drawPixelRect(x - width/2, y - height/2, width, height, 6, borderCol);
+                drawPixelRect(x - width/2 + 4, y - height/2 + 4, width - 8, height - 8, 4, bgCol);
                 ctx.fillStyle = textCol;
                 ctx.textAlign = 'center';
                 ctx.fillText(text, x, y + 5);
@@ -255,14 +273,32 @@
                 ctx.fillStyle = '#0f0f14';
                 ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-                if (this.state === 'CONNECTING') {
+                if (this.state === 'LOBBY') {
+                    this.drawPanel("ЛОББИ - PIXEL POKER", WIDTH/2, 60, COLORS.GOLD, COLORS.BLACK, COLORS.GOLD, 500, 60);
+                    
+                    if (this.rooms.length === 0) {
+                        ctx.fillStyle = COLORS.GRAY;
+                        ctx.textAlign = 'center';
+                        ctx.fillText("НЕТ ДОСТУПНЫХ КОМНАТ", WIDTH/2, HEIGHT/2);
+                    }
+
+                    this.rooms.forEach((room, i) => {
+                        const ry = 150 + i * 80;
+                        const isHover = false; // Можно добавить логику наведения
+                        this.drawPanel(`КОМНАТА: ${room.hostName.toUpperCase()}`, WIDTH/2, ry + 30, COLORS.WHITE, COLORS.BLUE, COLORS.WHITE, 800, 60);
+                    });
+
+                    this.drawPanel("СОЗДАТЬ ИГРУ", 825, 680, COLORS.BLACK, COLORS.GOLD, COLORS.WHITE, 250, 60);
+                    this.drawPanel("ОБНОВИТЬ", 150, 680, COLORS.WHITE, COLORS.GRAY, COLORS.WHITE, 200, 60);
+
+                } else if (this.state === 'CONNECTING') {
                     this.drawPanel("ПОДКЛЮЧЕНИЕ...", WIDTH/2, HEIGHT/2, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD);
                 } else if (this.state === 'WAITING' || !this.roomData) {
                     this.drawPanel("ОЖИДАНИЕ ИГРОКА...", WIDTH/2, HEIGHT/2, COLORS.WHITE, COLORS.BLACK, COLORS.GOLD, 400);
                     ctx.font = '8px "Press Start 2P"';
-                    ctx.fillText(`ROOM: ${this.roomID}`, WIDTH/2, HEIGHT/2 + 50);
-                    ctx.fillText(`ID: ${this.userId}`, WIDTH/2, HEIGHT/2 + 70);
+                    ctx.fillText(`ID КОМНАТЫ: ${this.roomRef?.id}`, WIDTH/2, HEIGHT/2 + 50);
                 } else {
+                    // Фон стола
                     drawPixelRect(30, 20, 940, 620, 32, COLORS.GREEN_DARK);
                     drawPixelRect(50, 40, 900, 580, 24, COLORS.GREEN_MID);
 
@@ -293,7 +329,7 @@
                     }
                     
                     if (this.state === 'SHOWDOWN' || this.state === 'FINISHED') {
-                        const winMsg = this.state === 'FINISHED' ? "ИГРА ОКОНЧЕНА" : "ФИНАЛ! ТАП ДЛЯ ПЕРЕЗАГРУЗКИ";
+                        const winMsg = this.state === 'FINISHED' ? "ИГРА ОКОНЧЕНА" : "ФИНАЛ! ТАП ДЛЯ ВЫХОДА";
                         this.drawPanel(winMsg, WIDTH/2, 400, COLORS.BLACK, COLORS.GOLD, COLORS.BLACK, 600);
                     }
                 }
@@ -302,7 +338,6 @@
             }
         };
 
-        // Запуск только после полной загрузки страницы
         window.onload = () => Game.init();
     </script>
     <style>
@@ -317,7 +352,7 @@
             height: 100vh; 
             color: #f0f0f5; 
             font-family: 'Press Start 2P', cursive;
-            touch-action: none; /* Предотвращает зум и скролл в Telegram */
+            touch-action: none;
         }
         #game-container { 
             position: relative; 
